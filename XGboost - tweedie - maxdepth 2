@@ -1,1 +1,85 @@
+library(data.table)
+library(ggplot2)
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(mlr3mbo)
+library(glmnet)
+library(OpenML)
+library(mlr3pipelines)
+library(mlr3filters)
+library(tidyr)
+library(dplyr)
+library(glex)
 
+
+set.seed(732)
+
+future::plan("multisession")
+setwd("C:/Users/alber/Dropbox/3. år uni/Interpretable Machine Learning/Aflevering 2")
+data = fread("Motor vehicle insurance data.csv")
+
+cond_1 = which(data$Distribution_channel != 1 & data$Distribution_channel != 0)
+data$Distribution_channel[cond_1] = matrix(data= NA, nrow=length(cond_1))
+
+#Initialize data
+data$ID = as.factor(data$ID)
+data$Distribution_channel = as.factor(data$Distribution_channel)
+data$Payment = as.factor(data$Payment)
+data$Type_risk = as.factor(data$Type_risk)
+data$Area = as.factor(data$Area)
+data$Second_driver = as.factor(data$Second_driver)
+data$N_doors = as.factor(data$N_doors)
+data$Type_fuel = as.factor(data$Type_fuel)
+
+data$Date_start_contract = as.Date(data$Date_start_contract, format = "%d-%m-%Y")
+data$Date_start_contract = as.numeric(data$Date_start_contract)
+data$Date_birth = as.Date(data$Date_birth, format = "%d-%m-%Y")
+data$Date_birth = as.numeric(data$Date_birth)
+data$Date_driving_licence = as.Date(data$Date_driving_licence, format = "%d-%m-%Y")
+data$Date_driving_licence = as.numeric(data$Date_driving_licence)
+
+data_num = data[,lapply(.SD, mean, na.rm = TRUE), by = ID, .SDcols = is.numeric]
+data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history")]
+data_fac = data[,lapply(.SD, function(x) x[1]), by = ID, .SDcols = is.factor]
+data = merge(data_num, data_fac[,-1], by = "ID")[,-1]
+rm(data_fac,data_num,cond_1)
+
+graph = po("imputemean", affect_columns = selector_name("Length")) %>>%  
+  po("imputesample", affect_columns = selector_type("factor")) %>>% 
+  po("encode") %>>% 
+  po("scale")
+
+task_tweedie = as_task_regr(data[,!"R_Claims_history"],target="Cost_claims_year")
+lrn_featureless = as_learner(graph %>>% lrn("regr.featureless"))
+lrn_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2, 
+                                        nrounds=to_tune(100,500), 
+                                        eta = to_tune(0.1,0.3), 
+                                        tweedie_variance_power = to_tune(1,2)) )
+
+at_tweedie = auto_tuner(tuner = tnr("random_search", batch_size = 8),
+                        learner = lrn_tweedie,
+                        resampling = rsmp("cv", folds = 5),
+                        measure = msr("regr.mae"),
+                        terminator = trm("evals", n_evals = 10))
+
+
+at_tweedie$train(task_tweedie)
+at_tweedie$archive$best()
+
+best_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2,
+                                         nrounds = 348, 
+                                         eta= 0.1869081,
+                                         tweedie_variance_power = 1.667094))
+
+
+
+design_tweedie = benchmark_grid(
+  tasks = task_tweedie, 
+  learners = list(best_tweedie, lrn_featureless),
+  resamplings = rsmp("cv", folds=3)
+  )
+
+results = benchmark(design=design_tweedie)
+
+results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
