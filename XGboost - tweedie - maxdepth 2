@@ -100,13 +100,6 @@ data_X[is.na(get("Distribution_channel")),
 data_X[is.na(get("Type_fuel")), 
        ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
                                           .N, replace = TRUE)]
-levels(data_X$Distribution_channel)
-levels(data$Distribution_channel)
-which(is.na(data_X$Distribution_channel))
-levels(data_X$Type_fuel)
-which(sum(data_matrix[,"Distribution_channel0"], data_matrix[,"Distribution_channel1"])!=1)
-which(is.na(data_X$Type_fuel))
-rm(data_matrix)
 
 data_matrix = model.matrix(~.-1, data= data_X)
 
