@@ -11,6 +11,8 @@ library(mlr3filters)
 library(tidyr)
 library(dplyr)
 library(glex)
+library(xgboost)
+library(patchwork)
 
 
 set.seed(732)
@@ -40,7 +42,7 @@ data$Date_driving_licence = as.Date(data$Date_driving_licence, format = "%d-%m-%
 data$Date_driving_licence = as.numeric(data$Date_driving_licence)
 
 data_num = data[,lapply(.SD, mean, na.rm = TRUE), by = ID, .SDcols = is.numeric]
-data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history")]
+data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history","R_Claims_history")]
 data_fac = data[,lapply(.SD, function(x) x[1]), by = ID, .SDcols = is.factor]
 data = merge(data_num, data_fac[,-1], by = "ID")[,-1]
 rm(data_fac,data_num,cond_1)
@@ -50,7 +52,7 @@ graph = po("imputemean", affect_columns = selector_name("Length")) %>>%
   po("encode") %>>% 
   po("scale")
 
-task_tweedie = as_task_regr(data[,!"R_Claims_history"],target="Cost_claims_year")
+task_tweedie = as_task_regr(data,target="Cost_claims_year")
 lrn_featureless = as_learner(graph %>>% lrn("regr.featureless"))
 lrn_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2, 
                                         nrounds=to_tune(100,500), 
@@ -64,14 +66,13 @@ at_tweedie = auto_tuner(tuner = tnr("random_search", batch_size = 8),
                         terminator = trm("evals", n_evals = 10))
 
 
-at_tweedie$train(task_tweedie)
+#at_tweedie$train(task_tweedie)
 at_tweedie$archive$best()
 
 best_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2,
                                          nrounds = 348, 
                                          eta= 0.1869081,
                                          tweedie_variance_power = 1.667094))
-
 
 
 design_tweedie = benchmark_grid(
@@ -83,3 +84,46 @@ design_tweedie = benchmark_grid(
 results = benchmark(design=design_tweedie)
 
 results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+data_target = data$Cost_claims_year
+data_X = data[,-"Cost_claims_year"]
+#Impute missing data length
+data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
+# Scale numeric variables
+numeric <- names(data_X)[sapply(data_X, is.numeric)]
+data_X[, (numeric) := lapply(.SD, scale), .SDcols = numeric]
+
+#Impute missing data DC,TF
+data_X[is.na(get("Distribution_channel")), 
+             ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
+                                                .N, replace = TRUE)]
+data_X[is.na(get("Type_fuel")), 
+       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
+                                          .N, replace = TRUE)]
+levels(data_X$Distribution_channel)
+levels(data$Distribution_channel)
+which(is.na(data_X$Distribution_channel))
+levels(data_X$Type_fuel)
+which(sum(data_matrix[,"Distribution_channel0"], data_matrix[,"Distribution_channel1"])!=1)
+which(is.na(data_X$Type_fuel))
+rm(data_matrix)
+
+data_matrix = model.matrix(~.-1, data= data_X)
+
+xg <- xgboost(data = data_matrix, label = data_target ,
+              params = list(max_depth = 2, eta = .01869081, 
+              objective = "reg:tweedie", tweedie_variance_power = 1.667094), nrounds = 348,
+              verbose = 0)
+
+res <- glex(xg, data_matrix) #### calculates functional decomposition with marginal identification
+res$m
+
+theme_set(theme_minimal(base_size = 13))
+vi_xgb <- glex_vi(res) 
+
+p_vi <- autoplot(vi_xgb, threshold = 0.01) + 
+  labs(title = NULL, tag = "XGBoost-explanation")
+
+p_vi+
+  plot_annotation(title = "Variable importance scores by term") & 
+  theme(plot.tag.position = "bottomleft")
