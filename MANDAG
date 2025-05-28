@@ -91,9 +91,7 @@ data_target = data$Cost_claims_year
 data_X = data[,-"Cost_claims_year"]
 
 
-res <- glex(best_tweedie, as.matrix(data_X)) #### calculates functional decomposition with marginal identification
-res$m
-test <- glex(best_tweedie$model$regr.xgboost$model,as.matrix(data[,-"Cost_claims_year"]))
+res <- glex(best_tweedie$model$regr.xgboost$model,as.matrix(data[,-"Cost_claims_year"]))
 best_tweedie$model$regr.xgboost$model
 
 theme_set(theme_minimal(base_size = 13))
