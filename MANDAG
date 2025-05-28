@@ -20,7 +20,6 @@ library(DALEXtra)
 set.seed(732)
 
 future::plan("multisession")
-setwd("C:/Users/alber/Dropbox/3. år uni/Interpretable Machine Learning/Aflevering 2")
 data = fread("Motor vehicle insurance data.csv")
 
 cond_1 = which(data$Distribution_channel != 1 & data$Distribution_channel != 0)
@@ -34,7 +33,7 @@ data$Type_risk = as.factor(data$Type_risk)
 data$Area = as.factor(data$Area)
 data$Second_driver = as.factor(data$Second_driver)
 data$N_doors = as.factor(data$N_doors)
-data$Type_fuel = as.factor(data$Type_fuel)
+data$Type_fuel = as.factor(ifelse(data$Type_fuel == "P", 1, ifelse(data$Type_fuel == "D", 0, data$Type_fuel)))
 
 data$Date_start_contract = as.Date(data$Date_start_contract, format = "%d-%m-%Y")
 data$Date_start_contract = as.numeric(data$Date_start_contract)
@@ -69,11 +68,11 @@ at_tweedie = auto_tuner(tuner = tnr("random_search", batch_size = 8),
 
 
 #at_tweedie$train(task_tweedie)
-at_tweedie$archive$best()
+#at_tweedie$archive$best()
 
 best_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2,
                                          nrounds = 348, 
-                                         eta= 0.1869081,
+                                         eta = 0.1869081,
                                          tweedie_variance_power = 1.667094))
 
 best_tweedie$train(task_tweedie)
@@ -84,40 +83,16 @@ design_tweedie = benchmark_grid(
   resamplings = rsmp("cv", folds=3)
   )
 
-results = benchmark(design=design_tweedie)
+results = benchmark(design = design_tweedie)
 
 results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
 
 data_target = data$Cost_claims_year
 data_X = data[,-"Cost_claims_year"]
-#Impute missing data length
-data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
-# Scale numeric variables
-numeric <- names(data_X)[sapply(data_X, is.numeric)]
-data_X[, (numeric) := lapply(.SD, scale), .SDcols = numeric]
 
-#Impute missing data DC,TF
-data_X[is.na(get("Distribution_channel")), 
-             ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
-                                                .N, replace = TRUE)]
-data_X[is.na(get("Type_fuel")), 
-       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
-                                          .N, replace = TRUE)]
 
-data_matrix = model.matrix(~.-1, data= data_X)
-
-xg <- xgboost(data = data_matrix, label = data_target ,
-              params = list(max_depth = 2, eta = .01869081, 
-              objective = "reg:tweedie", tweedie_variance_power = 1.667094), nrounds = 348,
-              verbose = 0)
-
-res <- glex(xg, data_matrix) #### calculates functional decomposition with marginal identification
+res <- glex(best_tweedie, as.matrix(data_X)) #### calculates functional decomposition with marginal identification
 res$m
-
-test <- glex(best_tweedie$model$regr.xgboost$model,as.matrix(data[,-"Cost_claims_year"]))
-
-hej <- data.table(ko=as.factor(c("tre","KO","bernal")),pølse=c(2,0,NA))
-as.matrix(hej)
 
 best_tweedie$model$regr.xgboost$model
 
@@ -131,18 +106,19 @@ p_vi+
   plot_annotation(title = "Variable importance scores by term") & 
   theme(plot.tag.position = "bottomleft")
 
-barplot(as.numeric(c(res$m$x1[which.min(x1==0)], res$m$x1[which.min(x1==1)])), names.arg=("female, male") )
+
 Payment1_value <- data_matrix[,"Payment1"]
 
 barplot(as.numeric(c(res$m$Payment1[which.min(Payment1_value==0)], res$m$Payment1[which.min(Payment1_value==1)])),
          names.arg=c("Half-year,Annual"))
 
 
-xgboost_exp = DALEXtra::explain_mlr3(best_tweedie,
-                                    data = data[,-"Cost_claims_year"],
-                                    y = data$Cost_claims_year,
-                                    label = "Claims",
-                                    colorize = FALSE)
+xgboost_exp = explain_mlr3(best_tweedie,
+                            data = data[,-"Cost_claims_year"],
+                            y = data$Cost_claims_year,
+                            label = "Claims",
+                            colorize = FALSE)
+
 random_pct = data[7361,-"Cost_claims_year"]
 random_pct
 
@@ -155,7 +131,7 @@ res$m
 #ICE
 random_rows_30 <- sample(1:nrow(data), 30)
 
-plot(predict_profile(xgboost_exp, data[random_rows_30,-"Cost_claims_year"]))
+plot(predict_profile(xgboost_exp, data_X[random_rows_30,]))
 
 #PDP
 xg_profiles = model_profile(xgboost_exp)
@@ -165,5 +141,4 @@ plot(xg_profiles) +
   ggtitle("Partial Dependence for insurance data","")
 
 
-test
 
