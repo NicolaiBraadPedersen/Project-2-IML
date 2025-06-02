@@ -1,0 +1,285 @@
+library(data.table)
+library(ggplot2)
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(mlr3mbo)
+library(glmnet)
+library(OpenML)
+library(mlr3pipelines)
+library(mlr3filters)
+library(tidyr)
+library(dplyr)
+library(glex)
+library(xgboost)
+library(patchwork)
+library(DALEX)
+library(DALEXtra)
+
+
+set.seed(732)
+
+future::plan("multisession")
+data = fread("Motor vehicle insurance data.csv")
+
+cond_1 = which(data$Distribution_channel != 1 & data$Distribution_channel != 0)
+data$Distribution_channel[cond_1] = matrix(data= NA, nrow=length(cond_1))
+
+#Initialize data
+data$ID = as.factor(data$ID)
+data$Distribution_channel = as.numeric(data$Distribution_channel)
+data$Payment = as.numeric(data$Payment)
+data$Type_risk = as.factor(data$Type_risk)
+data$Area = as.numeric(data$Area)
+data$Second_driver = as.numeric(data$Second_driver)
+data$N_doors = as.factor(data$N_doors)
+data$Type_fuel = as.factor(data$Type_fuel)
+
+data$Date_start_contract = as.Date(data$Date_start_contract, format = "%d/%m/%Y")
+data$Date_start_contract = as.numeric(data$Date_start_contract)
+data$Date_birth = as.Date(data$Date_birth, format = "%d/%m/%Y")
+data$Date_birth = as.numeric(data$Date_birth)
+data$Date_driving_licence = as.Date(data$Date_driving_licence, format = "%d/%m/%Y")
+data$Date_driving_licence = as.numeric(data$Date_driving_licence)
+
+
+data_num = data[,lapply(.SD, mean, na.rm = TRUE), by = ID, .SDcols = is.numeric]
+data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history","R_Claims_history")]
+data_fac = data[,lapply(.SD, function(x) x[1]), by = ID, .SDcols = is.factor]
+data = merge(data_num, data_fac[,-1], by = "ID")[,-1]
+rm(data_fac,data_num,cond_1)
+
+graph = po("imputemean", affect_columns = selector_name("Length")) %>>%  
+  po("imputesample", affect_columns = selector_type("factor")) %>>% 
+  po("encode") %>>% 
+  po("scale")
+
+task_tweedie = as_task_regr(data, target="Cost_claims_year")
+
+lrn_featureless = as_learner(lrn("regr.featureless"))
+
+lrn_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2, 
+                                        nrounds=to_tune(100,500), 
+                                        eta = to_tune(0.1,0.3), 
+                                        tweedie_variance_power = to_tune(1,2)) )
+
+at_tweedie = auto_tuner(tuner = tnr("random_search", batch_size = 8),
+                        learner = lrn_tweedie,
+                        resampling = rsmp("cv", folds = 3),
+                        measure = msr("regr.mae"),
+                        terminator = trm("evals", n_evals = 8))
+
+design_tweedie = benchmark_grid(
+  tasks = task_tweedie, 
+  learners = list(at_tweedie, lrn_featureless),
+  resamplings = rsmp("cv", folds=3)
+)
+
+at_tweedie$train(task_tweedie)
+
+results = benchmark(design = design_tweedie)
+
+#results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+
+#at_tweedie$train(task_tweedie)
+#at_tweedie$archive$best()
+
+best_tweedie = as_learner(graph %>>% lrn("regr.xgboost", objective="reg:tweedie", max_depth=2,
+                                         nrounds = 348, 
+                                         eta = 0.1869081,
+                                         tweedie_variance_power = 1.667094))
+
+best_tweedie$train(task_tweedie)
+
+
+##############################################################################################
+                                    ##Interpretable##
+##############################################################################################
+
+
+data_target = data$Cost_claims_year
+data_X = data[,-"Cost_claims_year"]
+
+#Impute missing data length
+data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
+
+#Impute missing data DC,TF
+data_X[is.na(get("Distribution_channel")), 
+       ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
+                                          .N, replace = TRUE)]
+data_X[is.na(get("Type_fuel")), 
+       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
+                               .N, replace = TRUE)]
+
+data_X$Payment = as.numeric(data_X$Payment)
+data_X$Distribution_channel = as.numeric(data_X$Distribution_channel)
+data_X$Area = as.numeric(data_X$Area)
+data_X$Second_driver = as.numeric(data_X$Second_driver)
+data_X$Type_fuel = as.numeric(ifelse(data_X$Type_fuel == "P", 1, ifelse(data_X$Type_fuel == "D", 0, data_X$Type_fuel)))
+
+data_matrix = model.matrix(~.-1, data= data_X)
+
+xg <- xgboost(data = data_matrix, label = data_target ,
+              params = list(max_depth = 2, eta = .01869081, 
+                            objective = "reg:tweedie", tweedie_variance_power = 1.667094), nrounds = 348,
+              verbose = 0)
+
+
+
+res <- glex(xg, data_matrix) #### calculates functional decomposition with marginal identification
+res$m
+
+theme_set(theme_minimal(base_size = 13))
+vi_xgb <- glex_vi(res) 
+
+p_vi <- autoplot(vi_xgb, threshold = 0.02) + 
+  labs(title = NULL, tag = "XGBoost-explanation")
+
+p_vi+
+  plot_annotation(title = "Variable importance scores by term") & 
+  theme(plot.tag.position = "bottomleft")
+
+
+Payment_value <- data_matrix[,"Payment"]
+
+barplot(as.numeric(c(res$m$ Payment1[which.min(Payment_value==0)], res$m$Payment1[which.min(Payment_value==1)])),
+        names.arg=c("Half-year,Annual"))
+
+
+xgboost_exp = explain_mlr3(best_tweedie,
+                           data = data[,-"Cost_claims_year"],
+                           y = data_target,
+                           label = "Claims",
+                           colorize = FALSE)
+
+
+random_pct = data[7361,-"Cost_claims_year"]
+random_pct
+
+predict(xgboost_exp, random_pct)
+plot(predict_parts(xgboost_exp, new_observation = random_pct))
+plot(predict_parts(xgboost_exp, new_observation = random_pct, type="shap"))
+
+res$m
+
+#ICE
+random_rows_30 <- sample(1:nrow(data), 30)
+features = c("Date_start_contract", 
+             "Payment", "Weight", 
+             "Value_vehicle", 
+             "Date_driving_licence", 
+             "Year_matriculation")
+
+ice = predict_profile(xgboost_exp, new_observation = data[random_rows_30,-"Cost_claims_year"],
+                      variables = features)
+
+plot(ice, variables = features)
+
+#PDP
+xg_profiles = model_profile(xgboost_exp)
+
+plot(xg_profiles) +
+  theme(legend.position = "top") +
+  ggtitle("Partial Dependence for insurance data","")
+
+
+Y1 = res$m$Date_start_contract
+Y2 = res$m$Year_matriculation
+
+Y12 = res$m$`Date_start_contract:Year_matriculation`
+
+X1 = data$Date_start_contract
+X2 = data$Year_matriculation
+
+ggplot() + 
+  geom_point(aes(x = X1, y = Y1))
+
+ggplot() + 
+  geom_point(aes(x = X2, y = Y2))
+
+
+ggplot() +
+  geom_line(aes(x = X1, y = Y1), size = 2 ,color = "#01665e") +
+  geom_line(aes(x = Y1_pdp$x_k, y = Y1_pdp$pdp_k), size = 2 ,color = "#bf812d") +
+  theme(plot.background = element_rect(fill = "#fafafa", color = NA),
+        panel.background = element_rect(fill = "#fafafa"),
+        legend.background = element_rect(fill = "#fafafa"),
+        axis.line = element_blank())+
+  labs(x = "Date_start_contract", y = "Interaction")
+
+ggplot() +
+  geom_line(aes(x = X2, y = Y2), color = "#35978f") + 
+  geom_line(aes(x = Y2_pdp$x_k, y = Y2_pdp$pdp_k), size = 2 ,color = "#bf812d") +
+  theme(plot.background = element_rect(fill = "#fafafa", color = NA),
+        panel.background = element_rect(fill = "#fafafa"),
+        legend.background = element_rect(fill = "#fafafa"),
+        axis.line = element_blank())+
+  labs(x = "Year_matriculation", y = "Interaction")
+
+ggplot(data, aes(x = X1, y = X2, color = Y12)) +
+  geom_point(size = 4) +  # control point size
+  scale_color_gradient2(low = "#01665e", mid = "#f6e8c3", high = "#bf812d") +
+  theme(plot.background = element_rect(fill = "#fafafa", color = NA),
+        panel.background = element_rect(fill = "#fafafa"),
+        legend.background = element_rect(fill = "#fafafa"),
+        axis.line = element_blank())+
+  labs(x = "Date_start_contract", y = "Year_matriculation", color = "Interaction")
+
+pdp_data = partial_dependency(xgboost_exp, variables = c("Date_start_contract","Year_matriculation"))
+
+
+ggplot(pdp_data, aes(x = "Date_start_Contract", y = "Year_matriculation", fill = `_yhat_`)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  theme_minimal() +
+  labs(title = "PDP Heatmap",
+       fill = "Prediction",
+       x = "Feature1",
+       y = "Feature2")
+
+
+
+
+
+
+#########
+## PDP ##
+#########
+
+pdp_xk <- function(data, learner, k, x_k) {
+  newX <- data
+  newX[, ..k] <- x_k
+  mean(predict(learner, as.data.frame(newX)))
+}
+
+## 2-dim pdp plot at a fixed point
+pdp_xjk <- function(data, learner, j, k, x_j, x_k) {
+  newX <- data
+  newX[, k] <- x_k
+  newX[, j] <- x_j
+  mean(predict(learner, as.data.frame(newX)))
+}
+
+#### calcualtes 1-dim pdp plot over a equi-distant grid of length I
+pdp <- function(dat, learner, k, I) {
+  my_grid <- seq(min(dat[, ..k]), max(dat[, ..k]), length.out = I)
+  return(list(x_k = my_grid, pdp_k = sapply(1:I, function(j) pdp_xk(dat, learner, k, my_grid[j]))))
+}
+
+min(data$Date_start_contract)
+max(data$Date_start_contract)
+
+unique(data$Year_matriculation)
+
+Y1_pdp = pdp(data, best_tweedie, "Date_start_contract", I = 100)
+
+Y2_pdp = pdp(data, best_tweedie, "Year_matriculation", I = 100)
+  
+  
+
+
+
+
+
+
