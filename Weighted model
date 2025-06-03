@@ -1,0 +1,78 @@
+##############################################################################################
+                                    ##non tweedie!##
+##############################################################################################
+
+###Manipulate data to add weights##
+
+n_original <- nrow(fread("Motor vehicle insurance data.csv"))  # replace with actual name if different
+
+# Step 2: Calculate how many times each ID occurs in the original data
+id_counts <- table(fread("Motor vehicle insurance data.csv")$ID)
+
+# Step 3: Expand the reduced 'data' to match the number of rows in the original data
+weighted_data <- data[rep(1:.N, times = id_counts[as.character(data_fac$ID)]), ]
+weighted_data <- weighted_data[,-c("Date_start_contract")]
+
+
+data_target = weighted_data$Cost_claims_year
+data_X = weighted_data[,-"Cost_claims_year"]
+
+#Impute missing data length
+data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
+
+#Impute missing data DC,TF
+data_X[is.na(get("Distribution_channel")), 
+       ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
+                                          .N, replace = TRUE)]
+data_X[is.na(get("Type_fuel")), 
+       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
+                               .N, replace = TRUE)]
+
+data_X$Payment = as.numeric(data_X$Payment)
+data_X$Distribution_channel = as.numeric(data_X$Distribution_channel)
+data_X$Area = as.numeric(data_X$Area)
+data_X$Second_driver = as.numeric(data_X$Second_driver)
+data_X$Type_fuel = as.numeric(ifelse(data_X$Type_fuel == "P", 1, ifelse(data_X$Type_fuel == "D", 0, data_X$Type_fuel)))
+
+data_matrix = model.matrix(~.-1, data= data_X)
+data_weighted = as.data.table(data_matrix)
+data_weighted[,Cost_claims_year:=data_target] 
+
+task_xg = as_task_regr(data_weighted, target="Cost_claims_year")
+
+at_xgboost = auto_tuner(tuner = tnr("random_search", batch_size = 8),
+                        learner = lrn("regr.xgboost",
+                                      max_depth = 2, 
+                                      nrounds = to_tune(100,500), 
+                                      eta = to_tune(0.1,0.3)),
+                        resampling = rsmp("cv", folds = 5),
+                        measure = msr("regr.mae"),
+                        terminator = trm("evals", n_evals = 16))
+
+
+design_tweedie = benchmark_grid(
+  tasks = task_xg, 
+  learners = list(at_xgboost, lrn_featureless),
+  resamplings = rsmp("cv", folds=5)
+)
+
+results = benchmark(design = design_tweedie)
+
+results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+at_xgboost$train(task_xg)
+
+
+at_xgboost$tuning_result
+
+lrn_xgboost = lrn("regr.xgboost",
+                  max_depth = 2, 
+                  nrounds = 123, 
+                  eta = 0.217)
+
+lrn_xgboost$train(task_xg)
+
+hist(lrn_xgboost$predict(task_xg)$response[lrn_xgboost$predict(task_xg)$response<1000])
+
+res <- glex(lrn_xgboost$model, data_matrix)
+res$intercept
