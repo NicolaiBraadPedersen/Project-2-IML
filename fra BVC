@@ -1,0 +1,138 @@
+library(data.table)
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(glex)
+library(ggplot2)
+library(patchwork)
+library(ALEPlot)
+data = fread("V:/Alle/Projekter/Boligprisindeks/Arbejdsrum AJC/Motor vehicle insurance data.csv")
+id_counts = table(data$ID)
+#CONDITIONS
+cond_1 = which(data$Distribution_channel != 1 & data$Distribution_channel != 0)
+data$Distribution_channel[cond_1] = matrix(data= NA, nrow=length(cond_1))
+
+#Initialize data
+data$ID = as.factor(data$ID)
+data$Distribution_channel = as.factor(data$Distribution_channel)
+data$Payment = as.factor(data$Payment)
+data$Type_risk = as.factor(data$Type_risk)
+data$Area = as.factor(data$Area)
+data$Second_driver = as.factor(data$Second_driver)
+data$N_doors = as.factor(data$N_doors)
+data$Type_fuel = as.factor(ifelse(data$Type_fuel == "P", 1, ifelse(data$Type_fuel == "D", 0, data$Type_fuel)))
+
+data$Date_start_contract = as.Date(data$Date_start_contract, format = "%d/%m/%Y")
+data$Date_start_contract = as.numeric(data$Date_start_contract)
+data$Date_birth = as.Date(data$Date_birth, format = "%d/%m/%Y")
+data$Age = as.numeric(difftime(Sys.Date(),data$Date_birth, units="days"))/365.25
+
+data$Date_birth = NULL
+data$Date_driving_licence = as.Date(data$Date_driving_licence, format = "%d/%m/%Y")
+data$Experience = as.numeric(difftime(Sys.Date(),data$Date_driving_licence, units="days"))/365.25
+data$Date_driving_licence = NULL
+
+data_num = data[,lapply(.SD, mean, na.rm = TRUE), by = ID, .SDcols = is.numeric]
+data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history","R_Claims_history")]
+data_fac = data[,lapply(.SD, function(x) x[1]), by = ID, .SDcols = is.factor]
+data = merge(data_num, data_fac[,-1], by = "ID")[,-1]
+
+# Step 2: Calculate how many times each ID occurs in the original data
+#id_counts <- table(fread("V:/Alle/Projekter/Boligprisindeks/Arbejdsrum AJC/Motor vehicle insurance data.csv")$ID)
+
+# Step 3: Expand the reduced 'data' to match the number of rows in the original data
+data = data[,Exposure:=id_counts[as.character(data_fac$ID)]]
+data = data[,!"Date_start_contract"]
+data_target = data$Cost_claims_year
+data_X = data[,-"Cost_claims_year"]
+
+
+data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
+
+#Impute missing data DC,TF
+data_X[is.na(get("Distribution_channel")), 
+       ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
+                                          .N, replace = TRUE)]
+data_X[is.na(get("Type_fuel")), 
+       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
+                               .N, replace = TRUE)]
+data_X$Exposure = as.numeric(data_X$Exposure)
+data_X$Payment = as.numeric(as.character(data_X$Payment))
+data_X$Distribution_channel = as.numeric(as.character(data_X$Distribution_channel))
+data_X$Area = as.numeric(as.character(data_X$Area))
+data_X$Second_driver = as.numeric(as.character(data_X$Second_driver))
+data_X$Type_fuel = as.numeric(ifelse(data_X$Type_fuel == "P", 1, ifelse(data_X$Type_fuel == "D", 0, data_X$Type_fuel)))
+range(data_X$Age)
+which(data_X$Age == max(data_X$Age))
+data_matrix = model.matrix(~.-1, data= data_X)
+data_task = as.data.table(data_matrix)
+data_task[,Cost_claims_year:=data_target] 
+
+task_xg = as_task_regr(data_task, target="Cost_claims_year")
+task_xg$set_col_roles("Exposure", roles = "weight")
+
+lrn_featureless = lrn("regr.featureless")
+at_xgboost = auto_tuner(tuner = tnr("random_search", batch_size = 8),
+                        learner = lrn("regr.xgboost",
+                                      max_depth = 2, 
+                                      nrounds = to_tune(100,500), 
+                                      eta = to_tune(0.1,0.3)),
+                        resampling = rsmp("cv", folds = 5),
+                        measure = msr("regr.mae"),
+                        terminator = trm("evals", n_evals = 16))
+
+
+#design = benchmark_grid(
+#   tasks = task_xg, 
+#   learners = list(at_xgboost, lrn_featureless),
+#   resamplings = rsmp("cv", folds=5)
+#)
+#design
+#results = benchmark(design)
+
+#results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+at_xgboost$train(task_xg)
+at_xgboost$archive$best()
+
+
+lrn_xgboost = lrn("regr.xgboost",
+                  max_depth = 2, 
+                  nrounds = 201, 
+                  eta = 0.1110389)
+
+lrn_xgboost$train(task_xg)
+predictions = lrn_xgboost$predict(task_xg)$response
+hist(predictions[predictions<1000])
+
+task_xg$feature_names
+
+data_u_exp = data_matrix[,-which(colnames(data_matrix)=="Exposure")]
+res <- glex(lrn_xgboost$model, data_u_exp)
+lrn_xgboost$model$features
+
+res$intercept
+theme_set(theme_minimal(base_size = 13))
+vi_xgb <- glex_vi(res) 
+
+p_vi <- autoplot(vi_xgb, threshold = 2) + 
+   labs(title = NULL, tag = "XGBoost-explanation")
+predict_hack <- function(X.model, newdata) {
+  return(predict(object = X.model, newdata = newdata))
+}
+
+ale1 <- ALEPlot(data_task, X.model = lrn_xgboost, pred.fun = predict_hack, J = 11)
+ggplot(data=data[data$Cost_claims_year<2000,], aes(x=Age, y=Cost_claims_year)) + geom_point()
+p_vi+
+   plot_annotation(title = "Variable importance scores by term") & 
+   theme(plot.tag.position = "bottomleft")
+
+p_vi2 <- autoplot(vi_xgb, by_degree = TRUE) + 
+  labs(title = NULL, subtitle = "XGBoost")
+plot_pdp(res,"Age")
+
+p_vi2 +
+  plot_annotation(title = "Variable importance scores by degree") 
+
+tjekliste = rowSums(res$m)+res$intercept - predictions
+range(tjekliste)
