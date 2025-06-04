@@ -1,0 +1,62 @@
+data = fread("V:/Alle/Projekter/Boligprisindeks/Arbejdsrum AJC/Motor vehicle insurance data.csv")
+
+#CONDITIONS
+cond_1 = which(data$Distribution_channel != 1 & data$Distribution_channel != 0)
+data$Distribution_channel[cond_1] = matrix(data= NA, nrow=length(cond_1))
+
+#Initialize data
+data$ID = as.factor(data$ID)
+data$Distribution_channel = as.factor(data$Distribution_channel)
+data$Payment = as.factor(data$Payment)
+data$Type_risk = as.factor(data$Type_risk)
+data$Area = as.factor(data$Area)
+data$Second_driver = as.factor(data$Second_driver)
+data$N_doors = as.factor(data$N_doors)
+data$Type_fuel = as.factor(ifelse(data$Type_fuel == "P", 1, ifelse(data$Type_fuel == "D", 0, data$Type_fuel)))
+
+data$Date_start_contract = as.Date(data$Date_start_contract, format = "%d/%m/%Y")
+data$Date_start_contract = as.numeric(data$Date_start_contract)
+data$Date_birth = as.Date(data$Date_birth, format = "%d/%m/%Y")
+data$Date_birth = as.numeric(data$Date_birth)
+data$Date_driving_licence = as.Date(data$Date_driving_licence, format = "%d/%m/%Y")
+data$Date_driving_licence = as.numeric(data$Date_driving_licence)
+
+data_num = data[,lapply(.SD, mean, na.rm = TRUE), by = ID, .SDcols = is.numeric]
+data_num = data_num[,-c("Lapse", "Premium", "N_claims_year", "N_claims_history","R_Claims_history")]
+data_fac = data[,lapply(.SD, function(x) x[1]), by = ID, .SDcols = is.factor]
+data = merge(data_num, data_fac[,-1], by = "ID")[,-1]
+
+# Step 2: Calculate how many times each ID occurs in the original data
+id_counts <- table(fread("Motor vehicle insurance data.csv")$ID)
+
+# Step 3: Expand the reduced 'data' to match the number of rows in the original data
+data = data[,Exposure:=id_counts[as.character(data_fac$ID)]]
+data = data[,!"Date_start_contract"]
+data_target = data$Cost_claims_year
+data_X = data[,-"Cost_claims_year"]
+
+
+data_X[is.na(get("Length")),("Length"):=mean(data_X[["Length"]],na.rm=TRUE)]
+
+#Impute missing data DC,TF
+data_X[is.na(get("Distribution_channel")), 
+       ("Distribution_channel") := sample(data_X[!is.na(get("Distribution_channel")), get("Distribution_channel")],
+                                          .N, replace = TRUE)]
+data_X[is.na(get("Type_fuel")), 
+       ("Type_fuel") := sample(data_X[!is.na(get("Type_fuel")), get("Type_fuel")],
+                               .N, replace = TRUE)]
+data_X$Exposure = as.numeric(data_X$Exposure)
+data_X$Payment = as.numeric(data_X$Payment)
+data_X$Distribution_channel = as.numeric(data_X$Distribution_channel)
+data_X$Area = as.numeric(data_X$Area)
+data_X$Second_driver = as.numeric(data_X$Second_driver)
+data_X$Type_fuel = as.numeric(ifelse(data_X$Type_fuel == "P", 1, ifelse(data_X$Type_fuel == "D", 0, data_X$Type_fuel)))
+
+data_matrix = model.matrix(~.-1, data= data_X)
+data_task = as.data.table(data_matrix)
+data_task[,Cost_claims_year:=data_target] 
+
+task_xg = as_task_regr(data_task, target="Cost_claims_year")
+task_xg$set_col_roles("Exposure", roles = "weight")
+
+
