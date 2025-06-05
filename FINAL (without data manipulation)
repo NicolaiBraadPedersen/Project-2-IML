@@ -1,0 +1,277 @@
+
+############
+##ML model##
+############
+
+task_xg = as_task_regr(data_task, target = "Cost_claims_year")
+
+task_xg$set_col_roles("Exposure", roles = "weight")
+
+lrn_featureless = lrn("regr.featureless")
+
+at_xgboost = auto_tuner(tuner = tnr("random_search", batch_size = 8),
+                        learner = lrn("regr.xgboost",
+                                      max_depth = 2, 
+                                      nrounds = to_tune(100,500), 
+                                      eta = to_tune(0.1,0.3)),
+                        resampling = rsmp("cv", folds = 5),
+                        measure = msr("regr.mae"),
+                        terminator = trm("evals", n_evals = 16))
+
+
+design = benchmark_grid(
+  tasks = task_xg, 
+  learners = list(at_xgboost, lrn_featureless),
+  resamplings = rsmp("cv", folds=5)
+)
+
+design
+results = benchmark(design)
+
+results$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+at_xgboost$train(task_xg)
+at_xgboost$archive$best()
+
+
+lrn_xgboost = lrn("regr.xgboost",
+                  max_depth = 2, 
+                  nrounds = 201, 
+                  eta = 0.1110389)
+
+lrn_xgboost$train(task_xg)
+
+design = benchmark_grid(
+  tasks = task_xg, 
+  learners = list(lrn_xgboost, lrn_featureless),
+  resamplings = rsmp("cv", folds=3)
+)
+
+results_xg = benchmark(design)
+
+results_xg$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+#################
+##Visualisation##
+#################
+
+predictions = lrn_xgboost$predict(task_xg)$response
+predictions = pmax(predictions, 0)
+hist(predictions)
+
+
+####################
+##Interpretebility##
+####################
+
+data_exp = data_task[,-c("Cost_claims_year","Exposure")]
+
+res = glex(lrn_xgboost$model, data_matrix[,-27], max_interaction = 2)
+
+xgboost_exp = explain_mlr3(lrn_xgboost,
+                            data = data_exp,
+                            y = data_task$Cost_claims_year,
+                            label = "Claims",
+                            colorize = FALSE)
+
+##Importance plot##
+
+theme_set(theme_minimal(base_size = 13))
+vi_xgb <- glex_vi(res) 
+
+p_vi <- autoplot(vi_xgb, threshold = 3.5) + 
+  labs(title = NULL, tag = "")
+
+p_vi
+
+##ICE plot##
+
+random_rows_30 <- sample(1:nrow(data_task), 30)
+features = c("Length",
+             "Cylinder_capacity",
+             "Weight",
+             "Date_birth",
+             "Date_driving_licence",
+             "Payment")
+
+ice = predict_profile(xgboost_exp, 
+                      new_observation = data_exp[random_rows_30], 
+                      variables = features)
+
+plot(ice, variables = features)
+
+##Isolated effects for 2 dim.##
+
+plot_twoway_effects(res, c("Length", "Cylinder_capacity"))
+
+##ALE + PDP plot##
+
+predict_hack <- function(X.model, newdata) {
+  return(predict(object = X.model, newdata = newdata))
+}
+
+
+ale_cyl <- ALEPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 13, K = 220)
+pdp_cyl <- PDPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 13, K = 91)
+
+pdp_2D <- PDPlot(X=data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J=c(15,13), K=10)
+
+
+ale_len <- ALEPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 15)
+pdp_len <- PDPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 15, K=41)
+
+
+ale_driv_lic <- ALEPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 2)
+pdp_driv_lic <- PDPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 2, K=41)
+
+
+ale_birth <- ALEPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 1)
+pdp_birth <- PDPlot(X = data_exp, X.model = lrn_xgboost, pred.fun = predict_hack, J = 1, K=41)
+
+#####################################
+
+df <- data.frame(
+  xale = ale_cyl$x.values,
+  fale = ale_cyl$f.values,
+  xpdp = pdp_cyl$x.values,
+  fpdp = pdp_cyl$f.values
+)
+
+# Reshape into long format
+df_long <- bind_rows(
+  data.frame(x = df$xale, y = df$fale - mean(df$fale), method = "ALE"),
+  data.frame(x = df$xpdp, y = df$fpdp - mean(df$fpdp), method = "PDP")
+)
+
+# Plot with proper color mapping
+ggplot(df_long, aes(x = x, y = y, color = method)) +
+  geom_line() +
+  scale_color_manual(values = c("ALE" = "#01665e", "PDP" = "#bf812d")) +
+  labs(color = "Method", title = "", x = "Cylinder capacity", y = "Prediction")
+
+#####################################
+
+df <- data.frame(
+  xale = ale_len$x.values,
+  fale = ale_len$f.values,
+  xpdp = pdp_len$x.values,
+  fpdp = pdp_len$f.values
+)
+
+# Reshape into long format
+df_long <- bind_rows(
+  data.frame(x = df$xale, y = df$fale - mean(df$fale), method = "ALE"),
+  data.frame(x = df$xpdp, y = df$fpdp - mean(df$fpdp), method = "PDP")
+)
+
+# Plot with proper color mapping
+ggplot(df_long, aes(x = x, y = y, color = method)) +
+  geom_line() +
+  scale_color_manual(values = c("ALE" = "#01665e", "PDP" = "#bf812d")) +
+  labs(color = "Method", title = "", x = "Length", y = "Prediction")
+
+#####################################
+
+df <- data.frame(
+  xale = ale_driv_lic$x.values,
+  fale = ale_driv_lic$f.values,
+  xpdp = pdp_driv_lic$x.values,
+  fpdp = pdp_driv_lic$f.values
+)
+
+# Reshape into long format
+df_long <- bind_rows(
+  data.frame(x = df$xale, y = df$fale - mean(df$fale), method = "ALE"),
+  data.frame(x = df$xpdp, y = df$fpdp - mean(df$fpdp), method = "PDP")
+)
+
+# Plot with proper color mapping
+ggplot(df_long, aes(x = x/365.24 + 1970, y = y, color = method)) +
+  geom_line() +
+  scale_color_manual(values = c("ALE" = "#01665e", "PDP" = "#bf812d")) +
+  labs(color = "Method", title = "", x = "Date driving licence", y = "Prediction")
+
+#####################################
+
+df <- data.frame(
+  xale = ale_birth$x.values,
+  fale = ale_birth$f.values,
+  xpdp = pdp_birth$x.values,
+  fpdp = pdp_birth$f.values
+)
+
+# Reshape into long format
+df_long <- bind_rows(
+  data.frame(x = df$xale, y = df$fale - mean(df$fale), method = "ALE"),
+  data.frame(x = df$xpdp, y = df$fpdp - mean(df$fpdp), method = "PDP")
+)
+
+# Plot with proper color mapping
+ggplot(df_long, aes(x = x/365.24 + 1970, y = y, color = method)) +
+  geom_line() +
+  scale_color_manual(values = c("ALE" = "#01665e", "PDP" = "#bf812d")) +
+  labs(color = "Method", title = "", x = "Date Birth", y = "Prediction")
+
+#####################################
+
+
+
+###############
+##De-bisasing##
+###############
+
+cols_to_remove <- names(res$m)[grepl("Date_birth", names(res$m), fixed = TRUE)]
+
+Debias_func_decomp = res$m
+Debias_func_decomp = Debias_predictions[, (cols_to_remove) := NULL]
+
+Debias_predictions = rowSums(Debias_func_decomp) + res$intercept
+Debias_predictions = pmax(Debias_predictions, 0)
+
+
+hist(Debias_predictions[Debias_predictions<1000])
+
+MSE_debias = mean((Debias_predictions-data$Cost_claims_year)^2)
+
+Reg_prediction = lrn_xgboost$predict(task_xg)$response
+
+MSE_reg = mean((Reg_prediction-data$Cost_claims_year)^2)
+
+###########################################
+##Histogram of all 3 types of predictions##
+###########################################
+
+ggplot() + 
+  geom_histogram(aes(predict_total[predict_total<800]), fill = "#01665e") + 
+  geom_histogram(aes(predictions[predictions<800]), fill = "#bf812d", alpha = 0.8) +
+  geom_histogram(aes(Debias_predictions[Debias_predictions<800]), fill = "#c7eae5", alpha = 0.5)
+
+
+####################################
+##Deep dive into 2 customer claims##
+####################################
+
+A = matrix(FALSE, length(Reg_prediction))
+
+Small_car = A
+Small_car[data$Length<4] = matrix(TRUE, length(Reg_prediction))[data$Length<4]
+
+which(Reg_prediction[Small_car]>250 & Reg_prediction[Small_car]<300)
+
+Long_car = A
+Long_car[data$Length>5] = matrix(TRUE, length(Reg_prediction))[data$Length>5]
+
+which(Reg_prediction[Long_car]>1000)
+
+#14 kort bil
+#223 lang bil
+
+short_car_cutsomer = data_exp[14]
+long_car_cutsomer = data_exp[223]
+
+plot(predict_parts(xgboost_exp, new_observation = short_car_cutsomer, type="shap"))
+plot(predict_parts(xgboost_exp, new_observation = long_car_cutsomer, type="shap"))
+
+
+
+
